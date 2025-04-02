@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-
+import torch.nn.functional as F
 import copy
 from collections import OrderedDict
 from typing import Union, List
@@ -172,7 +172,113 @@ class CLIPTextEncoder(nn.Module):
         return x
 
 
-class TextPromptLearner(nn.Module):
+class PromptLearner(nn.Module):
+    def __init__(self, cfg, classnames, clip_model):
+        super().__init__()
+        n_cls = len(classnames)
+        n_ctx = cfg.TRAINER.COCOOP.N_CTX
+        ctx_init = cfg.TRAINER.COCOOP.CTX_INIT
+        dtype = clip_model.dtype
+        ctx_dim = clip_model.ln_final.weight.shape[0]
+        vis_dim = clip_model.visual.output_dim
+        clip_imsize = clip_model.visual.input_resolution
+        cfg_imsize = cfg.INPUT.SIZE[0]
+        assert cfg_imsize == clip_imsize, f"cfg_imsize ({cfg_imsize}) must equal to clip_imsize ({clip_imsize})"
+
+        if ctx_init:
+            ctx_init = ctx_init.replace("_", " ")
+            n_ctx = len(ctx_init.split(" "))
+            prompt = clip.tokenize(ctx_init)
+            with torch.no_grad():
+                embedding = clip_model.token_embedding(prompt).type(dtype)
+            ctx_vectors = embedding[0, 1: 1 + n_ctx, :]
+            prompt_prefix = ctx_init
+        else:
+            ctx_vectors = torch.empty(n_ctx, ctx_dim, dtype=dtype)
+            nn.init.normal_(ctx_vectors, std=0.02)
+            prompt_prefix = " ".join(["X"] * n_ctx)
+
+        print(f'Initial context: "{prompt_prefix}"')
+        print(f"Number of context words (tokens): {n_ctx}")
+
+        # 可学习的 Prompt 参数
+        self.ctx = nn.Parameter(ctx_vectors)
+
+        # 定义可学习矩阵 W
+        self.W = nn.Parameter(torch.randn(ctx_dim + vis_dim, 1))
+
+        classnames = [name.replace("_", " ") for name in classnames]
+        name_lens = [len(_tokenizer.encode(name)) for name in classnames]
+        prompts = [prompt_prefix + " " + name + "." for name in classnames]
+
+        tokenized_prompts = torch.cat([clip.tokenize(p) for p in prompts])  # (n_cls, n_tkn)
+        with torch.no_grad():
+            embedding = clip_model.token_embedding(tokenized_prompts).type(dtype)
+
+        self.register_buffer("token_prefix", embedding[:, :1, :])  # SOS
+        self.register_buffer("token_suffix", embedding[:, 1 + n_ctx:, :])  # CLS, EOS
+
+        self.n_cls = n_cls
+        self.n_ctx = n_ctx
+        self.tokenized_prompts = tokenized_prompts
+        self.name_lens = name_lens
+
+    def construct_prompts(self, ctx, prefix, suffix, label=None):
+        if label is not None:
+            prefix = prefix[label]
+            suffix = suffix[label]
+
+        prompts = torch.cat(
+            [
+                prefix,  # (dim0, 1, dim)
+                ctx,  # (dim0, n_ctx, dim)
+                suffix,  # (dim0, *, dim)
+            ],
+            dim=1,
+        )
+        return prompts
+
+    def forward(self, im_features):
+        prefix = self.token_prefix
+        suffix = self.token_suffix
+        ctx = self.ctx  # (n_ctx, ctx_dim)
+
+        batch_size = im_features.shape[0]  # 获取 batch size
+        n_ctx = self.n_ctx  # 提示词的数量
+        ctx_dim = self.ctx.shape[1]  # 提示词的维度
+
+        # 扩展 ctx 维度 (1, n_ctx, ctx_dim) -> (batch, n_ctx, ctx_dim)
+        ctx = ctx.unsqueeze(0).expand(batch_size, -1, -1)
+
+        # 计算 score(s_i, ctx_i) = tanh(W [s_i; ctx_i])
+        s_expanded = im_features.unsqueeze(1).expand(-1, n_ctx, -1)  # (batch, n_ctx, vis_dim)
+        concat = torch.cat([s_expanded, ctx], dim=-1)  # (batch, n_ctx, ctx_dim + vis_dim)
+        scores = torch.tanh(concat @ self.W)  # (batch, n_ctx, 1)
+        scores = scores.squeeze(-1)  # (batch, n_ctx)
+
+        # 计算 Softmax 权重 a_i
+        attn_weights = F.softmax(scores, dim=-1)  # (batch, n_ctx)
+        attn_weights = attn_weights.unsqueeze(-1)  # (batch, n_ctx, 1)
+
+        # 计算加权求和 c_i = a_i * ctx_i
+        ctx_weighted = attn_weights * ctx  # (batch, n_ctx, ctx_dim)
+        C = ctx_weighted.sum(dim=1)  # (batch, ctx_dim)
+
+        # 更新 ctx: ctx = ctx + C
+        ctx_updated = ctx + C.unsqueeze(1)  # (batch, n_ctx, ctx_dim)
+
+        # 生成最终的 prompts
+        prompts = []
+        for ctx_i in ctx_updated:
+            ctx_i_expanded = ctx_i.unsqueeze(0).expand(self.n_cls, -1, -1)
+            pts_i = self.construct_prompts(ctx_i_expanded, prefix, suffix)  # (n_cls, n_tkn, ctx_dim)
+            prompts.append(pts_i)
+        prompts = torch.stack(prompts)  # (batch, n_cls, n_tkn, ctx_dim)
+
+        return prompts
+
+
+class TextPromptLearnerWithoutSummary(nn.Module):
     def __init__(self, classnames, text_model, num_prompts, prompts_init='', CSC=False, ctx_pos='end'):
         super().__init__()
 
