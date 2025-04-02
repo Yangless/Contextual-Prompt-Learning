@@ -179,21 +179,24 @@ class PromptLearner(nn.Module):
         n_ctx = cfg.TRAINER.COCOOP.N_CTX
         ctx_init = cfg.TRAINER.COCOOP.CTX_INIT
         dtype = clip_model.dtype
-        ctx_dim = clip_model.ln_final.weight.shape[0]
-        vis_dim = clip_model.visual.output_dim
+        ctx_dim = clip_model.ln_final.weight.shape[0] # Dimension of ctx
+        vis_dim = clip_model.visual.output_dim      # Dimension of image summary token (s)
         clip_imsize = clip_model.visual.input_resolution
         cfg_imsize = cfg.INPUT.SIZE[0]
         assert cfg_imsize == clip_imsize, f"cfg_imsize ({cfg_imsize}) must equal to clip_imsize ({clip_imsize})"
 
+        # --- Initialize original learnable context tokens (ctx) ---
         if ctx_init:
+            # Use given words to initialize context vectors
             ctx_init = ctx_init.replace("_", " ")
             n_ctx = len(ctx_init.split(" "))
             prompt = clip.tokenize(ctx_init)
             with torch.no_grad():
                 embedding = clip_model.token_embedding(prompt).type(dtype)
-            ctx_vectors = embedding[0, 1: 1 + n_ctx, :]
+            ctx_vectors = embedding[0, 1 : 1 + n_ctx, :]
             prompt_prefix = ctx_init
         else:
+            # Random initialization
             ctx_vectors = torch.empty(n_ctx, ctx_dim, dtype=dtype)
             nn.init.normal_(ctx_vectors, std=0.02)
             prompt_prefix = " ".join(["X"] * n_ctx)
@@ -201,79 +204,118 @@ class PromptLearner(nn.Module):
         print(f'Initial context: "{prompt_prefix}"')
         print(f"Number of context words (tokens): {n_ctx}")
 
-        # 可学习的 Prompt 参数
-        self.ctx = nn.Parameter(ctx_vectors)
+        # Register original ctx as learnable parameter
+        self.ctx = nn.Parameter(ctx_vectors) # Shape: (n_ctx, ctx_dim)
 
-        # 定义可学习矩阵 W
-        self.W = nn.Parameter(torch.randn(ctx_dim + vis_dim, 1))
+        # --- Define the attention scoring layer (replaces meta_net) ---
+        # Linear layer W for score: tanh(W[s; ctx])
+        # Input: concatenated features, Output: 1 (scalar score)
+        # add bias
+        self.attention_scorer = nn.Linear(vis_dim + ctx_dim, 1)
 
+
+        # --- Prepare classnames and fixed tokens (SOS, CLS, EOS) ---
         classnames = [name.replace("_", " ") for name in classnames]
-        name_lens = [len(_tokenizer.encode(name)) for name in classnames]
-        prompts = [prompt_prefix + " " + name + "." for name in classnames]
+        name_lens = [len(_tokenizer.encode(name)) for name in classnames] # Unused? Keep for now.
+        # Base prompts used only to get fixed embeddings
+        prompts_for_embedding = [prompt_prefix + " " + name + "." for name in classnames]
 
-        tokenized_prompts = torch.cat([clip.tokenize(p) for p in prompts])  # (n_cls, n_tkn)
+        tokenized_prompts = torch.cat([clip.tokenize(p) for p in prompts_for_embedding])
         with torch.no_grad():
             embedding = clip_model.token_embedding(tokenized_prompts).type(dtype)
 
-        self.register_buffer("token_prefix", embedding[:, :1, :])  # SOS
-        self.register_buffer("token_suffix", embedding[:, 1 + n_ctx:, :])  # CLS, EOS
+        # Register fixed parts as buffers (non-learnable but part of state)
+        self.register_buffer("token_prefix", embedding[:, :1, :])          # SOS, Shape: (n_cls, 1, ctx_dim)
+        self.register_buffer("token_suffix", embedding[:, 1 + n_ctx :, :]) # CLS & EOS, Shape: (n_cls, *, ctx_dim)
 
+        # Store constants
         self.n_cls = n_cls
         self.n_ctx = n_ctx
-        self.tokenized_prompts = tokenized_prompts
-        self.name_lens = name_lens
+        self.tokenized_prompts = tokenized_prompts # Token indices, needed by TextEncoder
+        # self.ctx_dim = ctx_dim # Redundant, can use self.ctx.shape[-1]
+        # self.vis_dim = vis_dim # Redundant, can use im_features.shape[-1] in forward
 
+    # construct_prompts method concatenates prefix, ctx, suffix
     def construct_prompts(self, ctx, prefix, suffix, label=None):
+        # Optional label-based selection (not used in this forward pass)
         if label is not None:
             prefix = prefix[label]
             suffix = suffix[label]
-
-        prompts = torch.cat(
-            [
-                prefix,  # (dim0, 1, dim)
-                ctx,  # (dim0, n_ctx, dim)
-                suffix,  # (dim0, *, dim)
-            ],
-            dim=1,
-        )
+        # Concatenate along token dimension (dim=1)
+        prompts = torch.cat([prefix, ctx, suffix], dim=1)
         return prompts
 
+    # --- Forward pass implementing the new attention-based update ---
     def forward(self, im_features):
-        prefix = self.token_prefix
-        suffix = self.token_suffix
-        ctx = self.ctx  # (n_ctx, ctx_dim)
+        """
+        Updates context tokens ctx based on image features (s) via attention,
+        then constructs final prompts for all classes.
 
-        batch_size = im_features.shape[0]  # 获取 batch size
-        n_ctx = self.n_ctx  # 提示词的数量
-        ctx_dim = self.ctx.shape[1]  # 提示词的维度
+        Args:
+            im_features (torch.Tensor): Image features (s). Shape: (batch_size, vis_dim).
 
-        # 扩展 ctx 维度 (1, n_ctx, ctx_dim) -> (batch, n_ctx, ctx_dim)
-        ctx = ctx.unsqueeze(0).expand(batch_size, -1, -1)
+        Returns:
+            torch.Tensor: Final prompt embeddings for all classes per image.
+                          Shape: (batch_size, n_cls, total_tokens, ctx_dim).
+        """
+        prefix = self.token_prefix       # Shape: (n_cls, 1, ctx_dim)
+        suffix = self.token_suffix       # Shape: (n_cls, *, ctx_dim)
+        ctx_original = self.ctx          # Shape: (n_ctx, ctx_dim)
 
-        # 计算 score(s_i, ctx_i) = tanh(W [s_i; ctx_i])
-        s_expanded = im_features.unsqueeze(1).expand(-1, n_ctx, -1)  # (batch, n_ctx, vis_dim)
-        concat = torch.cat([s_expanded, ctx], dim=-1)  # (batch, n_ctx, ctx_dim + vis_dim)
-        scores = torch.tanh(concat @ self.W)  # (batch, n_ctx, 1)
-        scores = scores.squeeze(-1)  # (batch, n_ctx)
+        batch_size = im_features.shape[0]
+        n_ctx = self.n_ctx
+        ctx_dim = self.ctx.shape[-1]     # Get ctx dimension dynamically
 
-        # 计算 Softmax 权重 a_i
-        attn_weights = F.softmax(scores, dim=-1)  # (batch, n_ctx)
-        attn_weights = attn_weights.unsqueeze(-1)  # (batch, n_ctx, 1)
+        # Prepare s and ctx for pairwise scoring
+        # Expand s per ctx token: (batch_size, n_ctx, vis_dim)
+        s_expanded = im_features.unsqueeze(1).expand(-1, n_ctx, -1)
+        # Expand ctx per batch item: (batch_size, n_ctx, ctx_dim)
+        ctx_expanded = ctx_original.unsqueeze(0).expand(batch_size, -1, -1)
 
-        # 计算加权求和 c_i = a_i * ctx_i
-        ctx_weighted = attn_weights * ctx  # (batch, n_ctx, ctx_dim)
-        C = ctx_weighted.sum(dim=1)  # (batch, ctx_dim)
+        # --- Step 1: Calculate scores for all (s, ctx) pairs ---
+        # Concatenate features: (batch_size, n_ctx, vis_dim + ctx_dim)
+        concat_features = torch.cat([s_expanded, ctx_expanded], dim=-1)
+        # Apply linear layer W: (batch_size, n_ctx, 1)
+        scores_raw = self.attention_scorer(concat_features)
+        # Apply tanh activation: (batch_size, n_ctx, 1)
+        scores_activated = torch.tanh(scores_raw)
+        # Remove trailing dim: (batch_size, n_ctx)
+        scores = scores_activated.squeeze(-1)
 
-        # 更新 ctx: ctx = ctx + C
-        ctx_updated = ctx + C.unsqueeze(1)  # (batch, n_ctx, ctx_dim)
+        # --- Step 2: Calculate attention weights 'a' ---
+        # Softmax scores along ctx dimension (dim=1) for each image
+        # attention_weights shape: (batch_size, n_ctx)
+        attention_weights = F.softmax(scores, dim=1)
 
-        # 生成最终的 prompts
+        # --- Step 3 & 4: Calculate aggregated context update 'C' ---
+        # Weighted sum of ctx tokens using attention weights
+        # Reshape weights for broadcasting: (batch_size, n_ctx, 1)
+        # C = sum(a_i * ctx_i) over i
+        # context_update_C shape: (batch_size, ctx_dim)
+        context_update_C = torch.sum(attention_weights.unsqueeze(-1) * ctx_expanded, dim=1)
+
+        # --- Step 5: Update ctx ---
+        # Add the aggregated context C to the original ctx for each batch item
+        # Use broadcasting: (1, n_ctx, ctx_dim) + (batch_size, 1, ctx_dim)
+        # ctx_shifted shape: (batch_size, n_ctx, ctx_dim)
+        ctx_shifted = ctx_original.unsqueeze(0) + context_update_C.unsqueeze(1)
+
+        # --- Step 6: Construct final prompts for all classes ---
+        # Initialize list to store prompts for each image
         prompts = []
-        for ctx_i in ctx_updated:
-            ctx_i_expanded = ctx_i.unsqueeze(0).expand(self.n_cls, -1, -1)
-            pts_i = self.construct_prompts(ctx_i_expanded, prefix, suffix)  # (n_cls, n_tkn, ctx_dim)
+        # Iterate through the batch dimension of updated contexts
+        for i in range(batch_size):
+            # Get updated context for the i-th image: (n_ctx, ctx_dim)
+            ctx_shifted_i = ctx_shifted[i]
+            # Expand context for all classes: (n_cls, n_ctx, ctx_dim)
+            ctx_i_expanded = ctx_shifted_i.unsqueeze(0).expand(self.n_cls, -1, -1)
+            # Construct prompts for this image (all classes): (n_cls, total_tokens, ctx_dim)
+            pts_i = self.construct_prompts(ctx_i_expanded, prefix, suffix)
             prompts.append(pts_i)
-        prompts = torch.stack(prompts)  # (batch, n_cls, n_tkn, ctx_dim)
+
+        # Stack prompts along the batch dimension
+        # Final prompts shape: (batch_size, n_cls, total_tokens, ctx_dim)
+        prompts = torch.stack(prompts)
 
         return prompts
 
