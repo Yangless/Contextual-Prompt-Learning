@@ -176,13 +176,24 @@ class PromptLearner(nn.Module):
     def __init__(self, cfg, classnames, clip_model):
         super().__init__()
         n_cls = len(classnames)
-        n_ctx = cfg.TRAINER.COCOOP.N_CTX
-        ctx_init = cfg.TRAINER.COCOOP.CTX_INIT
+
+
+        # n_ctx = cfg.TRAINER.COCOOP.N_CTX
+        # ctx_init = cfg.TRAINER.COCOOP.CTX_INIT
+        # dtype = clip_model.dtype
+        # ctx_dim = clip_model.ln_final.weight.shape[0] # Dimension of ctx
+        # vis_dim = clip_model.visual.output_dim      # Dimension of image summary token (s)
+        # clip_imsize = clip_model.visual.input_resolution
+        # cfg_imsize = cfg.INPUT.SIZE[0]
+        # assert cfg_imsize == clip_imsize, f"cfg_imsize ({cfg_imsize}) must equal to clip_imsize ({clip_imsize})"
+
+        n_ctx = 4
+        ctx_init = ""
         dtype = clip_model.dtype
-        ctx_dim = clip_model.ln_final.weight.shape[0] # Dimension of ctx
-        vis_dim = clip_model.visual.output_dim      # Dimension of image summary token (s)
+        ctx_dim = clip_model.ln_final.weight.shape[0]  # Dimension of ctx
+        vis_dim = clip_model.visual.output_dim  # Dimension of image summary token (s)
         clip_imsize = clip_model.visual.input_resolution
-        cfg_imsize = cfg.INPUT.SIZE[0]
+        cfg_imsize = 224
         assert cfg_imsize == clip_imsize, f"cfg_imsize ({cfg_imsize}) must equal to clip_imsize ({clip_imsize})"
 
         # --- Initialize original learnable context tokens (ctx) ---
