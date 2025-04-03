@@ -110,6 +110,12 @@ class Video_Text_Prompt_CLIP(nn.Module):
                 CSC=text_prompt_CSC,
                 ctx_pos=text_prompt_pos
             )
+
+            # self.prompt_learner = TextPromptLearner(
+            #     cfg=cfg,  # Pass the whole configuration object
+            #     classnames=classes,  # Pass the list of class names
+            #     clip_like_model=self.textual  # Pass the relevant model object
+            # )
             self.tokenized_prompts = self.prompt_learner.tokenized_prompts
 
         # freeze encoders,only update prompt
