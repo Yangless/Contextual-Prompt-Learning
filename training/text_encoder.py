@@ -173,7 +173,7 @@ class CLIPTextEncoder(nn.Module):
 
 
 class PromptLearner(nn.Module):
-    def __init__(self, cfg, classnames, clip_model):
+    def __init__(self,  classnames, clip_model):
         super().__init__()
         n_cls = len(classnames)
 
