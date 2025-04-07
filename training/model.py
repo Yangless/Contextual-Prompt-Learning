@@ -137,7 +137,7 @@ class Video_Text_Prompt_CLIP(nn.Module):
         B, C, T, H, W = x.size()
 
         # used in training
-        if self.use_text_prompt_learning:
+        if not self.use_text_prompt_learning:
             # text side
             prompts = self.prompt_learner()
             tokenized_prompts = self.tokenized_prompts
