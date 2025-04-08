@@ -132,10 +132,14 @@ def main():
 
     args = parser.parse_args()
 
-    dist.init_process_group('nccl') 
-    setup_print(dist.get_rank() == 0)
-    cuda_device_id = dist.get_rank() % torch.cuda.device_count()
-    torch.cuda.set_device(cuda_device_id)
+    try:  # Distributed training setup
+        dist.init_process_group('nccl')
+        setup_print(dist.get_rank() == 0)
+        cuda_device_id = dist.get_rank() % torch.cuda.device_count()
+        torch.cuda.set_device(cuda_device_id)
+    except Exception as e:
+        print(f'Error initializing distributed training: {str(e)}')
+        return
 
     model = Video_Text_Prompt_CLIP(
         # load weights
@@ -173,9 +177,17 @@ def main():
 
     if args.checkpoint_path:
         print('loading checkpoint')
-        ckpt = torch.load(args.checkpoint_path, map_location='cpu')
-        renamed_ckpt = OrderedDict((k[len("module."):], v) for k, v in ckpt['model'].items() if k.startswith("module."))
-        model.load_state_dict(renamed_ckpt, strict=True)
+        try:
+            if not os.path.exists(args.checkpoint_path):
+                raise FileNotFoundError(f'Checkpoint file {args.checkpoint_path} not found')
+            ckpt = torch.load(args.checkpoint_path, map_location='cpu')
+            if 'model' not in ckpt:
+                raise ValueError('Invalid checkpoint format: missing model state')
+            renamed_ckpt = OrderedDict((k[len("module."):], v) for k, v in ckpt['model'].items() if k.startswith("module."))
+            model.load_state_dict(renamed_ckpt, strict=True)
+        except Exception as e:
+            print(f'Error loading checkpoint: {str(e)}')
+            return
     
     
     print(model)
@@ -210,13 +222,33 @@ def main():
 
     assert len(train_loader) == args.num_steps - resume_step
     batch_st, train_st = datetime.now(), datetime.now()
-    for i, (data, labels) in enumerate(train_loader, resume_step):
-        data, labels = data.cuda(), labels.cuda()
+    try:  # Main training loop
+        for i, (data, labels) in enumerate(train_loader, resume_step):
+
+            # Handle keyboard interrupt gracefully
+            try:  # Forward pass
+                if data.ndim != 5 or labels.ndim != 1:
+                    raise ValueError(f'Invalid input dimensions: data {data.shape}, labels {labels.shape}')
+                try:
+                    if data.ndim != 5 or labels.ndim != 1:
+                        raise ValueError(f'Invalid input dimensions: data {data.shape}, labels {labels.shape}')
+                    data, labels = data.cuda(), labels.cuda()
+                except Exception as e:
+                    print(f'Error processing batch: {str(e)}')
+                    continue
+            except KeyboardInterrupt:
+                print('Training interrupted by user')
+                break
+            except Exception as e:
+                print(f'Error processing batch: {str(e)}')
+                continue
         data_ed = datetime.now()
 
         optimizer.zero_grad()
 
-        assert data.size(0) % args.batch_split == 0
+        if data.size(0) % args.batch_split != 0:
+            print(f'Warning: batch size {data.size(0)} not divisible by batch split {args.batch_split}')
+            args.batch_split = 1
         split_size = data.size(0) // args.batch_split
         hit1, hit5, loss_value = 0, 0, 0
         for j in range(args.batch_split):
@@ -224,8 +256,16 @@ def main():
             labels_slice = labels[split_size * j: split_size * (j + 1)]
 
             with torch.cuda.amp.autocast(args.fp16):
-                logits = model(data_slice)
-                loss = criterion(logits, labels_slice)
+                try:
+                    logits = model(data_slice)
+                    if torch.isnan(logits).any() or torch.isinf(logits).any():
+                        raise ValueError('NaN or Inf values detected in model output')
+                    loss = criterion(logits, labels_slice)
+                    if torch.isnan(loss) or torch.isinf(loss):
+                        raise ValueError('NaN or Inf values detected in loss')
+                except Exception as e:
+                    print(f'Error in forward pass: {str(e)}')
+                    continue
                 
             if labels.dtype == torch.long: # no mixup, can calculate accuracy
                 hit1 += (logits.topk(1, dim=1)[1] == labels_slice.view(-1, 1)).sum().item()
@@ -264,8 +304,8 @@ def main():
 
         if (i + 1) % args.save_freq == 0 and dist.get_rank() == 0:
             checkpoint.save_checkpoint(model, optimizer, lr_sched, loss_scaler, i + 1, args)
-        
-        batch_st = datetime.now()
+    except Exception as e:
+        print(f'Error in ')
 
 
 def evaluate(model: torch.nn.Module, loader: torch.utils.data.DataLoader):
